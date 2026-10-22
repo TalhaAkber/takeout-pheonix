@@ -53,14 +53,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PHOTOS_PATH="$1"
 
 if [ -z "$PHOTOS_PATH" ]; then
-    # Try common paths
-    if [ -d "$SCRIPT_DIR/extracted/Takeout/Google Photos" ]; then
-        PHOTOS_PATH="$SCRIPT_DIR/extracted/Takeout/Google Photos"
-    elif [ -d "$SCRIPT_DIR/Takeout/Google Photos" ]; then
-        PHOTOS_PATH="$SCRIPT_DIR/Takeout/Google Photos"
-    elif [ -d "$SCRIPT_DIR/Google Photos" ]; then
-        PHOTOS_PATH="$SCRIPT_DIR/Google Photos"
-    else
+    # Try common paths relative to where you're running this from (cwd)
+    # first -- that's where your data is when the scripts live in a
+    # cloned subfolder -- then fall back to relative to the script itself.
+    for base in "." "$SCRIPT_DIR"; do
+        if [ -d "$base/extracted/Takeout/Google Photos" ]; then
+            PHOTOS_PATH="$base/extracted/Takeout/Google Photos"
+        elif [ -d "$base/Takeout/Google Photos" ]; then
+            PHOTOS_PATH="$base/Takeout/Google Photos"
+        elif [ -d "$base/Google Photos" ]; then
+            PHOTOS_PATH="$base/Google Photos"
+        fi
+        [ -n "$PHOTOS_PATH" ] && break
+    done
+
+    if [ -z "$PHOTOS_PATH" ]; then
         echo -e "${RED}ERROR: Could not find Google Photos directory.${NC}"
         echo ""
         echo -e "${YELLOW}Please provide the path as an argument:${NC}"
