@@ -1,0 +1,9 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# generated per-run state — regenerate with build_batches.py, don't commit
+batch_*.txt
+manifest.csv
+*.progress
+ROOT.txt
