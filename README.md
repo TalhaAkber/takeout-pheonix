@@ -28,8 +28,31 @@ brew install exiftool jq android-platform-tools          # macOS
 sudo apt install libimage-exiftool-perl jq android-tools-adb   # Linux
 ```
 
-Windows: `setup-windows.ps1` installs everything -- see
-[Quickstart (Windows)](#quickstart-windows).
+**Windows** (PowerShell, not cmd) -- run the setup script once from the
+repo folder; it installs whatever is missing and asks for admin (one UAC
+prompt) only for the long-path setting:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\takeout-pheonix\scripts\setup-windows.ps1
+```
+
+Or do the same by hand:
+
+```powershell
+winget install --id Git.Git -e                # git, to clone the repo
+winget install --id Python.Python.3.13 -e     # provides the `py` launcher
+winget install --id OliverBetz.ExifTool -e
+winget install --id Google.PlatformTools -e   # adb
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned   # allow local .ps1 scripts
+
+# long path support -- in an *admin* PowerShell:
+New-ItemProperty -Path HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem -Name LongPathsEnabled -Value 1 -PropertyType DWord -Force
+```
+
+Open a new PowerShell window afterwards so the new tools are on PATH. If
+`adb devices` lists nothing once the phone is plugged in, install your
+phone's USB driver (Pixel: Google USB Driver; Samsung: Samsung Android USB
+Driver).
 
 ## Quickstart (macOS / Linux)
 
