@@ -6,4 +6,10 @@ __pycache__/
 batch_*.txt
 manifest.csv
 *.progress
+*.push_failed
+*.still_pending
+.*.pending.tmp*
 ROOT.txt
+restore-metadata-errors.txt
+extract-errors.txt
+.takeout-phoenix-staging/

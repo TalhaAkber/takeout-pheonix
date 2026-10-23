@@ -194,8 +194,10 @@ process_json() {
         fi
     fi
 
-    # GPS coordinates (skip if 0,0)
-    if [ "$lat" != "0" ] || [ "$lon" != "0" ]; then
+    # GPS coordinates (skip if 0,0). Compare numerically: jq prints "0.0" for
+    # Takeout's no-location placeholder, which a string test against "0"
+    # misses -- that would stamp photos with a bogus 0,0 location.
+    if [ "$(echo "$lat != 0 || $lon != 0" | bc -l)" = "1" ]; then
         args+=("-GPSLatitude=$lat")
         args+=("-GPSLongitude=$lon")
 
@@ -211,7 +213,7 @@ process_json() {
             args+=("-GPSLongitudeRef=W")
         fi
 
-        if [ "$alt" != "0" ]; then
+        if [ "$(echo "$alt != 0" | bc -l)" = "1" ]; then
             args+=("-GPSAltitude=$alt")
             if (( $(echo "$alt >= 0" | bc -l) )); then
                 args+=("-GPSAltitudeRef=0")

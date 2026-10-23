@@ -1,0 +1,4 @@
+# Bash and Python scripts must keep LF endings even when cloned on Windows
+# with core.autocrlf=true (CRLF breaks the shebang / bash parsing).
+*.sh text eol=lf
+*.py text eol=lf

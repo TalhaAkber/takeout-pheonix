@@ -10,7 +10,10 @@
 #
 # Env overrides:
 #   GPHOTOS_UPLOAD_DIR   Destination folder on the phone (default: /sdcard/Pictures/GPhotosUpload)
-#   CHUNK_SIZE           How many MediaStore rows to unpend per on-device call (default: 400)
+#
+# Failures are listed by filename at the end of a run, and kept in:
+#   batch_NNN.push_failed    files that failed to push
+#   batch_NNN.still_pending  files still hidden from Google Photos (is_pending=1)
 
 set -u
 
@@ -18,7 +21,8 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT=$(cat "$DIR/ROOT.txt")
 MANIFEST="$DIR/manifest.csv"
 DEST="${GPHOTOS_UPLOAD_DIR:-/sdcard/Pictures/GPhotosUpload}"
-CHUNK_SIZE="${CHUNK_SIZE:-400}"
+DEST_NAME="$(basename "$DEST")"
+DEVICE_IDS_FILE="/data/local/tmp/takeout_phoenix_pending_ids.txt"
 
 # ---- progress bar helper -----------------------------------------------
 # print_progress <current> <total> <label> <start_epoch> <detail>
@@ -44,10 +48,8 @@ print_progress() {
         local rate_per_sec=$(( current * 10 / elapsed ))   # x10 for one decimal
         rate_str=$(printf '%d.%d' $((rate_per_sec / 10)) $((rate_per_sec % 10)))
         local remaining=$(( total - current ))
-        if [ "$current" -gt 0 ]; then
-            local eta_sec=$(( remaining * elapsed / current ))
-            eta_str=$(printf '%dm%02ds' $((eta_sec / 60)) $((eta_sec % 60)))
-        fi
+        local eta_sec=$(( remaining * elapsed / current ))
+        eta_str=$(printf '%dm%02ds' $((eta_sec / 60)) $((eta_sec % 60)))
     fi
     local elapsed_str
     elapsed_str=$(printf '%dm%02ds' $((elapsed / 60)) $((elapsed % 60)))
@@ -62,6 +64,35 @@ print_progress() {
         "$label" "$bar" "$current" "$total" "$percent" "$rate_str" "$elapsed_str" "$eta_str" "" "$detail"
 }
 # -------------------------------------------------------------------------
+
+# list_pending: prints "<id> <path>" for every MediaStore row under $DEST
+# that is still is_pending=1. Only "Row:" lines are kept -- `content query`
+# prints "No result found." when nothing matches, which must not be counted
+# as a pending file.
+# Note: MediaStore's _data column holds the resolved real path
+# (/storage/emulated/0/...), not the /sdcard/... symlink, so match on the
+# folder name rather than the literal $DEST prefix.
+list_pending() {
+    adb shell "content query --uri content://media/external/file --projection _id:_data --where \"_data LIKE '%$DEST_NAME/%' AND is_pending=1\"" < /dev/null 2>/dev/null \
+        | tr -d '\r' \
+        | sed -nE 's/^Row: [0-9]+ _id=([0-9]+), _data=(.*)$/\1 \2/p'
+}
+
+# print_file_list <file> <title>: prints basenames from a list file, capped.
+print_file_list() {
+    local file=$1 title=$2 max=50 n=0
+    echo "$title"
+    while IFS= read -r media_path; do
+        n=$((n + 1))
+        if [ "$n" -le "$max" ]; then
+            echo "  - $(basename "$media_path")"
+        fi
+    done < "$file"
+    if [ "$n" -gt "$max" ]; then
+        echo "  ... and $((n - max)) more"
+    fi
+    echo "  (full list: $file)"
+}
 
 if ! command -v adb &> /dev/null; then
     echo "ERROR: adb not found. Install with: brew install android-platform-tools"
@@ -86,6 +117,9 @@ fi
 
 BATCH_FILE="$DIR/$BATCH.txt"
 PROGRESS_FILE="$DIR/$BATCH.progress"
+PUSH_FAILED_FILE="$DIR/$BATCH.push_failed"
+STILL_PENDING_FILE="$DIR/$BATCH.still_pending"
+PENDING_TMP="$DIR/.$BATCH.pending.tmp"
 
 if [ ! -f "$BATCH_FILE" ]; then
     echo "ERROR: $BATCH_FILE not found."
@@ -93,6 +127,7 @@ if [ ! -f "$BATCH_FILE" ]; then
 fi
 
 touch "$PROGRESS_FILE"
+: > "$PUSH_FAILED_FILE"
 
 TOTAL=$(wc -l < "$BATCH_FILE" | tr -d ' ')
 ALREADY=$(wc -l < "$PROGRESS_FILE" | tr -d ' ')
@@ -120,6 +155,7 @@ while IFS= read -r rel; do
 
     if [ ! -f "$src" ]; then
         printf "\n  MISSING SOURCE, skipping: %s\n" "$rel"
+        echo "$rel" >> "$PUSH_FAILED_FILE"
         continue
     fi
 
@@ -130,6 +166,7 @@ while IFS= read -r rel; do
         print_progress "$done_count" "$TOTAL" "Push" "$push_start" "$(basename "$rel")"
     else
         printf "\n  FAILED (will retry next run): %s\n" "$rel"
+        echo "$rel" >> "$PUSH_FAILED_FILE"
         failed=$((failed + 1))
     fi
 done < "$BATCH_FILE"
@@ -139,34 +176,40 @@ echo ""
 # shell's identity never get finalized), which hides them from every app,
 # including Google Photos' backup scanner. Clear the flag on everything
 # under $DEST so newly pushed files actually get picked up.
-# Note: MediaStore's _data column holds the resolved real path
-# (/storage/emulated/0/...), not the /sdcard/... symlink, so match on the
-# folder name rather than the literal $DEST prefix.
-DEST_NAME="$(basename "$DEST")"
-pending_ids=$(adb shell "content query --uri content://media/external/file --projection _id --where \"_data LIKE '%$DEST_NAME/%' AND is_pending=1\"" < /dev/null 2>/dev/null | sed -E 's/Row: [0-9]+ _id=//')
-if [ -n "$pending_ids" ]; then
-    unpend_count=$(echo "$pending_ids" | grep -c .)
-    echo "Clearing is_pending on $unpend_count file(s) so Google Photos can see them (on-device, chunked)..."
+list_pending > "$PENDING_TMP"
+unpend_count=$(wc -l < "$PENDING_TMP" | tr -d ' ')
+if [ "$unpend_count" -gt 0 ]; then
+    echo "Clearing is_pending on $unpend_count file(s) so Google Photos can see them..."
+    # Ship the id list to the phone and loop there: one adb session for the
+    # whole batch, with the device echoing an OK/FAIL line per file so the
+    # bar advances per file. Each `content update` still forks a process on
+    # the phone -- that, not USB, is why this phase is slow.
+    cut -d' ' -f1 "$PENDING_TMP" > "$PENDING_TMP.ids"
+    adb push "$PENDING_TMP.ids" "$DEVICE_IDS_FILE" > /dev/null 2>&1
+    rm -f "$PENDING_TMP.ids"
+
     clear_start=$(date +%s)
-    cleared_so_far=0
-    # Run the updates in one on-device shell loop per chunk instead of one
-    # adb round-trip per file -- thousands of individual round-trips is far
-    # too slow for a 5-10k file batch. Each content-update call still forks
-    # a process on the device, so this is inherently slower than the push
-    # itself; it's just the least-slow option without root access.
-    echo "$pending_ids" | xargs -n "$CHUNK_SIZE" | while IFS= read -r chunk; do
-        remote_cmd=""
-        chunk_n=0
-        for id in $chunk; do
-            remote_cmd+="content update --uri content://media/external/file/$id --bind is_pending:i:0; "
-            chunk_n=$((chunk_n + 1))
-        done
-        adb shell "$remote_cmd" < /dev/null > /dev/null 2>&1
-        cleared_so_far=$((cleared_so_far + chunk_n))
-        print_progress "$cleared_so_far" "$unpend_count" "Clear" "$clear_start" "chunk of $chunk_n ids"
-    done
+    cleared=0
+    clear_failed=0
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        status="${line%% *}"
+        id="${line#* }"
+        media_path=$(awk -v id="$id" '$1 == id { sub(/^[^ ]+ /, ""); print; exit }' "$PENDING_TMP")
+        name="$(basename "${media_path:-id $id}")"
+        case "$status" in
+            OK)
+                cleared=$((cleared + 1)) ;;
+            FAIL)
+                clear_failed=$((clear_failed + 1))
+                printf "\n  CLEAR FAILED: %s\n" "$name" ;;
+            *)
+                continue ;;
+        esac
+        print_progress $((cleared + clear_failed)) "$unpend_count" "Clear" "$clear_start" "$name"
+    done < <(adb shell "for id in \$(cat $DEVICE_IDS_FILE); do out=\$(content update --uri content://media/external/file/\$id --bind is_pending:i:0 2>&1); if [ -z \"\$out\" ]; then echo \"OK \$id\"; else echo \"FAIL \$id\"; fi; done; rm -f $DEVICE_IDS_FILE" < /dev/null 2>/dev/null)
     echo ""
-    echo "Cleared is_pending on $unpend_count file(s)."
+    echo "Cleared is_pending on $cleared/$unpend_count file(s) ($clear_failed failed)."
 fi
 
 DONE_COUNT=$(wc -l < "$PROGRESS_FILE" | tr -d ' ')
@@ -176,9 +219,23 @@ echo "=== $BATCH: $DONE_COUNT/$TOTAL files pushed total (this run: $pushed_this_
 # Re-check live state rather than trusting that the clearing loop above ran
 # to completion -- a cable drop mid-clearing must not get marked done, or
 # the leftover pending files would be silently skipped forever.
-still_pending=$(adb shell "content query --uri content://media/external/file --projection _id --where \"_data LIKE '%$DEST_NAME/%' AND is_pending=1\"" < /dev/null 2>/dev/null | grep -c . || true)
+list_pending | cut -d' ' -f2- > "$STILL_PENDING_FILE"
+rm -f "$PENDING_TMP"
+still_pending=$(wc -l < "$STILL_PENDING_FILE" | tr -d ' ')
 
-if [ "$DONE_COUNT" -ge "$TOTAL" ] && [ "${still_pending:-0}" -eq 0 ]; then
+if [ -s "$PUSH_FAILED_FILE" ]; then
+    print_file_list "$PUSH_FAILED_FILE" "Failed to push:"
+else
+    rm -f "$PUSH_FAILED_FILE"
+fi
+
+if [ "$still_pending" -gt 0 ]; then
+    print_file_list "$STILL_PENDING_FILE" "Still hidden from Google Photos (is_pending=1):"
+else
+    rm -f "$STILL_PENDING_FILE"
+fi
+
+if [ "$DONE_COUNT" -ge "$TOTAL" ] && [ "$still_pending" -eq 0 ]; then
     # mark done in manifest
     awk -F, -v b="$BATCH" 'BEGIN{OFS=","} NR==1{print; next} {if($1==b) $4="done"; print}' "$MANIFEST" > "$MANIFEST.tmp"
     mv "$MANIFEST.tmp" "$MANIFEST"
@@ -186,7 +243,7 @@ if [ "$DONE_COUNT" -ge "$TOTAL" ] && [ "${still_pending:-0}" -eq 0 ]; then
     echo "Next step: on the phone, let Google Photos finish backing this batch up,"
     echo "then use Google Photos > 'Free up space' to clear it, then run this script again."
 elif [ "$DONE_COUNT" -ge "$TOTAL" ]; then
-    echo "$BATCH fully pushed, but $still_pending file(s) are still marked is_pending"
+    echo "$BATCH fully pushed, but $still_pending file(s) above are still marked is_pending"
     echo "(clearing was likely interrupted, e.g. a cable disconnect). NOT marking done."
     echo "Re-run './push_next.sh $BATCH' to finish clearing before moving to the next batch."
 else
